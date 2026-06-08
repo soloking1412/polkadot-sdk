@@ -303,21 +303,87 @@ impl<Block: BlockT> ParentSearchParams<Block> {
 	}
 }
 
-/// A potential parent block returned from [`find_parent_for_building`]
+/// A potential parent block returned from [`find_parent_for_building`].
+///
+/// V3 additionally carries the local view of the unincluded segment between included and
+/// best (oldest first, exclusive of included); V2 only exposes the segment endpoints.
 #[derive(PartialEq, Clone)]
-pub struct ParentSearchResult<Block: BlockT> {
-	/// The header of the included block (confirmed on relay chain).
-	pub included_header: Block::Header,
-	/// The header of the best parent block to build on.
-	pub best_parent_header: Block::Header,
+pub enum ParentSearchResult<Block: BlockT> {
+	V2 {
+		/// The header of the included block (confirmed on relay chain).
+		included_header: Block::Header,
+		/// The header of the best parent block to build on.
+		best_parent_header: Block::Header,
+	},
+	V3 {
+		/// The header of the included block (confirmed on relay chain).
+		included_header: Block::Header,
+		/// The header of the best parent block to build on.
+		best_parent_header: Block::Header,
+		/// Unincluded parablocks ordered oldest first (just after the included block) to
+		/// newest (best parent). Empty when best parent equals the included block.
+		unincluded_segment: Vec<Block::Header>,
+	},
+}
+
+impl<Block: BlockT> ParentSearchResult<Block> {
+	/// The included block (relay-chain-confirmed head of the parachain).
+	pub fn included_header(&self) -> &Block::Header {
+		match self {
+			Self::V2 { included_header, .. } | Self::V3 { included_header, .. } => included_header,
+		}
+	}
+
+	/// The block to build the next parablock on top of.
+	pub fn best_parent_header(&self) -> &Block::Header {
+		match self {
+			Self::V2 { best_parent_header, .. } | Self::V3 { best_parent_header, .. } => {
+				best_parent_header
+			},
+		}
+	}
+
+	/// The unincluded segment for V3 (oldest first, exclusive of included). `None` for V2.
+	pub fn unincluded_segment(&self) -> Option<&[Block::Header]> {
+		match self {
+			Self::V2 { .. } => None,
+			Self::V3 { unincluded_segment, .. } => Some(unincluded_segment),
+		}
+	}
+
+	/// Replace the best parent with its parent (one step back). For V3, also pops the matching
+	/// tail entry of the unincluded segment to keep it in sync with the new best.
+	pub fn walk_best_parent_back(&mut self, new_best: Block::Header) {
+		match self {
+			Self::V2 { best_parent_header, .. } => *best_parent_header = new_best,
+			Self::V3 { best_parent_header, unincluded_segment, .. } => {
+				*best_parent_header = new_best;
+				unincluded_segment.pop();
+			},
+		}
+	}
+
+	/// Fall the best parent back to the included block (the segment becomes empty for V3).
+	pub fn fall_back_to_included(&mut self) {
+		match self {
+			Self::V2 { best_parent_header, included_header } => {
+				*best_parent_header = included_header.clone()
+			},
+			Self::V3 { best_parent_header, included_header, unincluded_segment } => {
+				*best_parent_header = included_header.clone();
+				unincluded_segment.clear();
+			},
+		}
+	}
 }
 
 impl<B: BlockT> std::fmt::Debug for ParentSearchResult<B> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("ParentSearchResult")
-			.field("included_number", &self.included_header.number())
-			.field("best_parent_hash", &self.best_parent_header.hash())
-			.field("best_parent_number", &self.best_parent_header.number())
+			.field("included_number", &self.included_header().number())
+			.field("best_parent_hash", &self.best_parent_header().hash())
+			.field("best_parent_number", &self.best_parent_header().number())
+			.field("unincluded_segment_len", &self.unincluded_segment().map(|s| s.len()))
 			.finish()
 	}
 }
@@ -367,10 +433,11 @@ pub async fn find_parent_for_building<Block: BlockT>(
 			let best_parent_header =
 				find_deepest_valid_parent(backend, start_header, start_hash, &rp_ancestry);
 
-			Ok(Some(ParentSearchResult { included_header, best_parent_header }))
+			Ok(Some(ParentSearchResult::V2 { included_header, best_parent_header }))
 		},
 		ParentSearchParams::V3 { scheduling_parent, para_best_hash } => {
 			let mut para_best_header = None;
+			let mut unincluded_segment_newest_first = Vec::new();
 			let mut current_hash = para_best_hash;
 			let best_parent_header = loop {
 				let Some(current_header) = get_para_header(backend, current_hash) else {
@@ -398,6 +465,8 @@ pub async fn find_parent_for_building<Block: BlockT>(
 					break para_best_header;
 				}
 
+				unincluded_segment_newest_first.push(current_header.clone());
+
 				if current_header.number() <= start_header.number() {
 					break None;
 				}
@@ -405,9 +474,13 @@ pub async fn find_parent_for_building<Block: BlockT>(
 				current_hash = *current_header.parent_hash();
 			};
 
-			Ok(Some(ParentSearchResult {
+			let mut unincluded_segment = unincluded_segment_newest_first;
+			unincluded_segment.reverse();
+
+			Ok(Some(ParentSearchResult::V3 {
 				included_header,
 				best_parent_header: best_parent_header.unwrap_or(start_header),
+				unincluded_segment,
 			}))
 		},
 	}
