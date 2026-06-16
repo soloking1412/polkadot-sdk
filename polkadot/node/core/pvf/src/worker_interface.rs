@@ -242,8 +242,8 @@ impl WorkerHandle {
 
 		// The revive_jit worker builds a PolkaVM engine via `polkavm::Config::from_env()`; forward
 		// the `POLKAVM_*` tuning vars (e.g. `POLKAVM_CORE_PINNING`) that `env_clear` above strips.
-		// Gated to the experiment: a production validation worker must keep a cleared environment so
-		// that execution stays deterministic across validators.
+		// Gated to the experiment: a production validation worker must keep a cleared environment
+		// so that execution stays deterministic across validators.
 		#[cfg(revive_jit)]
 		for (key, value) in std::env::vars_os() {
 			if key.to_string_lossy().starts_with("POLKAVM_") {
