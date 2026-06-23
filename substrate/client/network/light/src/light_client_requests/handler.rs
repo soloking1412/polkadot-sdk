@@ -27,16 +27,18 @@ use codec::{self, Decode, Encode};
 use futures::prelude::*;
 use log::{debug, trace};
 use prost::Message;
-use sc_client_api::{BlockBackend, ProofProvider};
+use sc_client_api::{BlockBackend, ExecutionProofProvider, ProofProvider};
 use sc_network::{
 	config::ProtocolId,
 	request_responses::{IncomingRequest, OutgoingResponse},
 	NetworkBackend, ReputationChange,
 };
 use sc_network_types::PeerId;
+use sp_blockchain::HeaderBackend;
 use sp_core::{
 	hexdisplay::HexDisplay,
 	storage::{ChildInfo, ChildType, PrefixedStorageKey},
+	traits::SpawnNamed,
 };
 use sp_runtime::traits::Block;
 use std::{marker::PhantomData, sync::Arc};
@@ -52,19 +54,28 @@ pub struct LightClientRequestHandler<B, Client> {
 	request_receiver: async_channel::Receiver<IncomingRequest>,
 	/// Blockchain client.
 	client: Arc<Client>,
+	/// Task spawner, used to pre-warm the capped runtime off the async reactor.
+	spawn_handle: Box<dyn SpawnNamed>,
 	_block: PhantomData<B>,
 }
 
 impl<B, Client> LightClientRequestHandler<B, Client>
 where
 	B: Block,
-	Client: BlockBackend<B> + ProofProvider<B> + Send + Sync + 'static,
+	Client: BlockBackend<B>
+		+ HeaderBackend<B>
+		+ ProofProvider<B>
+		+ ExecutionProofProvider<B>
+		+ Send
+		+ Sync
+		+ 'static,
 {
 	/// Create a new [`LightClientRequestHandler`].
 	pub fn new<N: NetworkBackend<B, <B as Block>::Hash>>(
 		protocol_id: &ProtocolId,
 		fork_id: Option<&str>,
 		client: Arc<Client>,
+		spawn_handle: Box<dyn SpawnNamed>,
 	) -> (Self, N::RequestResponseProtocolConfig) {
 		let (tx, request_receiver) = async_channel::bounded(MAX_LIGHT_REQUEST_QUEUE);
 
@@ -79,11 +90,40 @@ where
 			tx,
 		);
 
-		(Self { client, request_receiver, _block: PhantomData::default() }, protocol_config)
+		(
+			Self { client, request_receiver, spawn_handle, _block: PhantomData::default() },
+			protocol_config,
+		)
+	}
+
+	/// Pre-warm the dedicated capped executor by compiling the runtime ahead of the first
+	/// light-client call request.
+	///
+	/// The capped executor compiles into its own engine, so the first `RemoteCallRequest` would
+	/// otherwise pay a (potentially multi-second, much longer in debug builds) compile and likely
+	/// time out on the network. Run it once, off the async reactor, on the blocking pool.
+	fn prewarm(&self) {
+		let client = self.client.clone();
+		let best_hash = client.info().best_hash;
+		self.spawn_handle.spawn_blocking(
+			"light-client-request-prewarm",
+			Some("networking"),
+			async move {
+				if let Err(e) = client.execution_proof_with_limit(best_hash, "Core_version", &[]) {
+					debug!(
+						target: LOG_TARGET,
+						"Light client capped-runtime pre-warm failed: {}", e,
+					);
+				}
+			}
+			.boxed(),
+		);
 	}
 
 	/// Run [`LightClientRequestHandler`].
 	pub async fn run(mut self) {
+		self.prewarm();
+
 		while let Some(request) = self.request_receiver.next().await {
 			let IncomingRequest { peer, payload, pending_response } = request;
 
@@ -140,7 +180,13 @@ where
 			}
 		}
 	}
+}
 
+impl<B, Client> LightClientRequestHandler<B, Client>
+where
+	B: Block,
+	Client: ProofProvider<B> + ExecutionProofProvider<B>,
+{
 	fn handle_request(
 		&mut self,
 		peer: PeerId,
@@ -168,7 +214,13 @@ where
 
 		Ok(data)
 	}
+}
 
+impl<B, Client> LightClientRequestHandler<B, Client>
+where
+	B: Block,
+	Client: ExecutionProofProvider<B>,
+{
 	fn on_remote_call_request(
 		&mut self,
 		peer: &PeerId,
@@ -178,25 +230,36 @@ where
 
 		let block = Decode::decode(&mut request.block.as_ref())?;
 
-		let response = match self.client.execution_proof(block, &request.method, &request.data) {
-			Ok((_, proof)) => schema::v1::light::RemoteCallResponse { proof: Some(proof.encode()) },
-			Err(e) => {
-				trace!(
-					"remote call request from {} ({} at {:?}) failed with: {}",
-					peer,
-					request.method,
-					request.block,
-					e,
-				);
-				schema::v1::light::RemoteCallResponse { proof: None }
-			},
-		};
+		// Use the capped executor: a call exceeding the configured wall-clock limit traps and is
+		// reported here as an error, yielding an empty proof (same as any other execution failure).
+		let response =
+			match self.client.execution_proof_with_limit(block, &request.method, &request.data) {
+				Ok((_, proof)) => {
+					schema::v1::light::RemoteCallResponse { proof: Some(proof.encode()) }
+				},
+				Err(e) => {
+					trace!(
+						"remote call request from {} ({} at {:?}) failed (possibly timed out) with: {}",
+						peer,
+						request.method,
+						request.block,
+						e,
+					);
+					schema::v1::light::RemoteCallResponse { proof: None }
+				},
+			};
 
 		Ok(schema::v1::light::Response {
 			response: Some(schema::v1::light::response::Response::RemoteCallResponse(response)),
 		})
 	}
+}
 
+impl<B, Client> LightClientRequestHandler<B, Client>
+where
+	B: Block,
+	Client: ProofProvider<B>,
+{
 	fn on_remote_read_request(
 		&mut self,
 		peer: &PeerId,
@@ -313,5 +376,84 @@ fn fmt_keys(first: Option<&Vec<u8>>, last: Option<&Vec<u8>>) -> String {
 		}
 	} else {
 		String::from("n/a")
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use codec::Encode;
+	use sc_client_api::StorageProof;
+	use sc_network_types::PeerId;
+
+	type TestBlock = sp_runtime::testing::Block<
+		sp_runtime::testing::TestXt<sp_runtime::testing::MockCallU64, ()>,
+	>;
+	type TestHash = <TestBlock as Block>::Hash;
+
+	/// A client whose capped execution-proof call either succeeds with an empty proof or fails,
+	/// simulating a normal call vs. one trapped by the execution timeout.
+	struct MockClient {
+		capped_call_fails: bool,
+	}
+
+	impl ExecutionProofProvider<TestBlock> for MockClient {
+		fn execution_proof_with_limit(
+			&self,
+			_hash: TestHash,
+			_method: &str,
+			_call_data: &[u8],
+		) -> sp_blockchain::Result<(Vec<u8>, StorageProof)> {
+			if self.capped_call_fails {
+				// Stands in for an epoch-deadline trap surfaced as an execution error.
+				Err(sp_blockchain::Error::Backend("simulated capped execution trap".into()))
+			} else {
+				Ok((Vec::new(), StorageProof::empty()))
+			}
+		}
+	}
+
+	fn handler(client: MockClient) -> LightClientRequestHandler<TestBlock, MockClient> {
+		let (_tx, request_receiver) = async_channel::bounded(MAX_LIGHT_REQUEST_QUEUE);
+		LightClientRequestHandler {
+			request_receiver,
+			client: Arc::new(client),
+			spawn_handle: Box::new(sp_core::testing::TaskExecutor::new()),
+			_block: PhantomData,
+		}
+	}
+
+	fn remote_call_request() -> schema::v1::light::RemoteCallRequest {
+		schema::v1::light::RemoteCallRequest {
+			block: TestHash::default().encode(),
+			method: "Core_version".to_string(),
+			data: Vec::new(),
+		}
+	}
+
+	fn call_response_proof(response: schema::v1::light::Response) -> Option<Vec<u8>> {
+		match response.response {
+			Some(schema::v1::light::response::Response::RemoteCallResponse(r)) => r.proof,
+			other => panic!("unexpected response: {:?}", other),
+		}
+	}
+
+	#[test]
+	fn capped_call_timeout_yields_empty_proof() {
+		let mut handler = handler(MockClient { capped_call_fails: true });
+		let response = handler
+			.on_remote_call_request(&PeerId::random(), &remote_call_request())
+			.unwrap();
+		// A trapped/timed-out call is reported to the peer as an empty proof, not an error.
+		assert_eq!(call_response_proof(response), None);
+	}
+
+	#[test]
+	fn successful_call_yields_a_proof() {
+		let mut handler = handler(MockClient { capped_call_fails: false });
+		let response = handler
+			.on_remote_call_request(&PeerId::random(), &remote_call_request())
+			.unwrap();
+		assert!(call_response_proof(response).is_some());
 	}
 }

@@ -22,6 +22,20 @@ use sp_runtime::traits::Block as BlockT;
 use sp_state_machine::{KeyValueStates, KeyValueStorageLevel};
 use sp_storage::ChildInfo;
 
+/// Provides execution proofs subject to a wall-clock limit, for serving untrusted (e.g.
+/// light-client) requests without letting a single call consume unbounded CPU.
+pub trait ExecutionProofProvider<Block: BlockT> {
+	/// Execute `method` at `hash` and return its execution proof, trapping the call if it exceeds
+	/// the executor's configured wall-clock limit (if any). Behaves like
+	/// [`ProofProvider::execution_proof`] when no limit is configured.
+	fn execution_proof_with_limit(
+		&self,
+		hash: Block::Hash,
+		method: &str,
+		call_data: &[u8],
+	) -> sp_blockchain::Result<(Vec<u8>, StorageProof)>;
+}
+
 /// Interface for providing block proving utilities.
 pub trait ProofProvider<Block: BlockT> {
 	/// Reads storage value at a given block + key, returning read proof.
